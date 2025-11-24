@@ -13,7 +13,8 @@ from config import read_global_config, get_config_sync
 from auth import get_auth_headers_with_retry, refresh_account_token, NoAccountAvailableError, TokenRefreshError
 from account_manager import (
     list_enabled_accounts, list_all_accounts, get_account,
-    create_account, update_account, delete_account, get_random_account
+    create_account, update_account, delete_account, get_random_account,
+    get_random_channel_by_model
 )
 from models import ClaudeRequest
 from converter import convert_claude_to_codewhisperer_request, codewhisperer_request_to_dict
@@ -136,15 +137,35 @@ async def health():
 @app.post("/v1/messages")
 async def create_message(request: Request):
     """
-    Claude API 兼容的消息创建端点
-    接收 Claude 格式的请求，转换为 CodeWhisperer 格式并返回流式响应
+    Claude API 兼容的消息创建端点（智能路由）
+    根据模型和账号数量自动选择渠道（Amazon Q 或 Gemini）
     """
     try:
         # 解析请求体
         request_data = await request.json()
+        model = request_data.get('model', 'claude-sonnet-4.5')
 
-        # 标准 Claude API 格式 - 转换为 conversationState
-        logger.info(f"收到标准 Claude API 请求: {request_data.get('model', 'unknown')}")
+        logger.info(f"收到 Claude API 请求: model={model}")
+
+        # 智能路由：根据模型选择渠道
+        specified_account_id = request.headers.get("X-Account-ID")
+
+        if not specified_account_id:
+            # 没有指定账号时，根据模型智能选择渠道
+            channel = get_random_channel_by_model(model)
+
+            if not channel:
+                raise HTTPException(status_code=503, detail="没有可用的账号")
+
+            logger.info(f"智能路由选择渠道: {channel}")
+
+            # 如果选择了 Gemini 渠道，转发到 /v1/gemini/messages
+            if channel == 'gemini':
+                logger.info(f"转发请求到 Gemini 渠道")
+                return await create_gemini_message(request)
+
+        # 继续使用 Amazon Q 渠道的原有逻辑
+        logger.info(f"使用 Amazon Q 渠道处理请求")
 
         # 转换为 ClaudeRequest 对象
         claude_req = parse_claude_request(request_data)

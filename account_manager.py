@@ -91,6 +91,52 @@ def get_random_account(account_type: Optional[str] = None) -> Optional[Dict[str,
     return random.choice(accounts)
 
 
+def get_random_channel_by_model(model: str) -> Optional[str]:
+    """根据模型智能选择渠道（按账号数量加权）
+
+    Args:
+        model: 请求的模型名称
+
+    Returns:
+        渠道名称 ('amazonq' 或 'gemini')，如果没有可用账号则返回 None
+    """
+    # Gemini 独占模型
+    gemini_only_models = ['gemini-2.0-flash-exp']
+
+    # 如果是 Gemini 独占模型，只返回 gemini 渠道
+    if model in gemini_only_models:
+        gemini_accounts = list_enabled_accounts(account_type='gemini')
+        if gemini_accounts:
+            return 'gemini'
+        return None
+
+    # 对于其他模型（两个渠道都支持），按账号数量加权随机选择
+    amazonq_accounts = list_enabled_accounts(account_type='amazonq')
+    gemini_accounts = list_enabled_accounts(account_type='gemini')
+
+    amazonq_count = len(amazonq_accounts)
+    gemini_count = len(gemini_accounts)
+
+    # 如果没有任何可用账号
+    if amazonq_count == 0 and gemini_count == 0:
+        return None
+
+    # 如果只有一个渠道有账号
+    if amazonq_count == 0:
+        return 'gemini'
+    if gemini_count == 0:
+        return 'amazonq'
+
+    # 按账号数量加权随机选择
+    total = amazonq_count + gemini_count
+    rand = random.randint(1, total)
+
+    if rand <= amazonq_count:
+        return 'amazonq'
+    else:
+        return 'gemini'
+
+
 def get_account(account_id: str) -> Optional[Dict[str, Any]]:
     """根据ID获取账号"""
     with _conn() as conn:
