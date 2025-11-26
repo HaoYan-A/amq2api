@@ -771,12 +771,16 @@ async function testSingleAccount(accountId) {
 
   try {
     const endpoint = acc.type === 'gemini' ? '/v1/gemini/messages' : '/v1/messages';
+    const headers = {
+      'content-type': 'application/json',
+      'X-Account-ID': accountId
+    };
+    const adminKey = getAdminKey();
+    if (adminKey) headers['x-api-key'] = adminKey;
+
     const r = await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'X-Account-ID': accountId
-      },
+      headers,
       body: JSON.stringify({
         model: acc.type === 'gemini' ? 'gemini-3-pro' : 'claude-sonnet-4',
         max_tokens: 50,
@@ -843,12 +847,16 @@ async function testAllAccounts() {
   for (const acc of enabled) {
     try {
       const endpoint = acc.type === 'gemini' ? '/v1/gemini/messages' : '/v1/messages';
+      const headers = {
+        'content-type': 'application/json',
+        'X-Account-ID': acc.id
+      };
+      const adminKey = getAdminKey();
+      if (adminKey) headers['x-api-key'] = adminKey;
+
       const r = await fetch(endpoint, {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'X-Account-ID': acc.id
-        },
+        headers,
         body: JSON.stringify({
           model: acc.type === 'gemini' ? 'gemini-3-pro' : 'claude-sonnet-4',
           max_tokens: 50,
