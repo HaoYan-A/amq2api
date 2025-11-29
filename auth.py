@@ -196,6 +196,7 @@ async def get_account_with_token() -> Tuple[Optional[Dict[str, Any]], str]:
                 # 如果是账号被封禁错误，尝试切换到下一个账号
                 if "账号已被封禁" in error_msg or "invalid_grant" in error_msg.lower():
                     logger.warning(f"账号 {account_id} 被封禁，尝试切换到其他账号 (尝试 {attempt + 1}/{max_retries})")
+                    max_retries = 999999
                     continue
                 else:
                     # 其他类型的刷新错误，直接抛出

@@ -802,6 +802,87 @@ async def manual_refresh_endpoint(account_id: str, _: bool = Depends(verify_admi
         raise HTTPException(status_code=500, detail=f"刷新 token 失败: {str(e)}")
 
 
+@app.post("/v2/accounts/refresh-all")
+async def refresh_all_accounts(_: bool = Depends(verify_admin_key)):
+    """批量刷新所有 Amazon Q 账号的 token，检测被封禁账号"""
+    try:
+        # 获取所有 Amazon Q 类型的账号
+        all_accounts = list_all_accounts()
+        amazonq_accounts = [acc for acc in all_accounts if acc.get('type', 'amazonq') == 'amazonq']
+
+        if not amazonq_accounts:
+            return JSONResponse(content={
+                "success": True,
+                "message": "没有 Amazon Q 账号需要刷新",
+                "total": 0,
+                "results": []
+            })
+
+        results = []
+        success_count = 0
+        failed_count = 0
+        banned_count = 0
+
+        logger.info(f"开始批量刷新 {len(amazonq_accounts)} 个 Amazon Q 账号")
+
+        for account in amazonq_accounts:
+            account_id = account.get('id')
+            account_label = account.get('label', 'N/A')
+            result = {
+                "id": account_id,
+                "label": account_label,
+                "status": "unknown",
+                "message": ""
+            }
+
+            try:
+                # 尝试刷新 token
+                refreshed_account = await refresh_account_token(account)
+                result["status"] = "success"
+                result["message"] = "Token 刷新成功"
+                success_count += 1
+                logger.info(f"账号 {account_id} ({account_label}) 刷新成功")
+
+            except TokenRefreshError as e:
+                error_msg = str(e)
+                result["message"] = error_msg
+
+                # 检测是否被封禁
+                if "账号已被封禁" in error_msg or "invalid_grant" in error_msg.lower():
+                    result["status"] = "banned"
+                    banned_count += 1
+                    logger.warning(f"账号 {account_id} ({account_label}) 已被封禁")
+                else:
+                    result["status"] = "failed"
+                    failed_count += 1
+                    logger.error(f"账号 {account_id} ({account_label}) 刷新失败: {error_msg}")
+
+            except Exception as e:
+                result["status"] = "error"
+                result["message"] = f"未知错误: {str(e)}"
+                failed_count += 1
+                logger.error(f"账号 {account_id} ({account_label}) 刷新时发生错误: {e}")
+
+            results.append(result)
+
+        summary = {
+            "success": True,
+            "message": f"批量刷新完成: 成功 {success_count}, 失败 {failed_count}, 被封禁 {banned_count}",
+            "total": len(amazonq_accounts),
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "banned_count": banned_count,
+            "results": results
+        }
+
+        logger.info(f"批量刷新完成: 总计 {len(amazonq_accounts)}, 成功 {success_count}, 失败 {failed_count}, 被封禁 {banned_count}")
+        return JSONResponse(content=summary)
+
+    except Exception as e:
+        logger.error(f"批量刷新账号失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"批量刷新失败: {str(e)}")
+
+
 @app.get("/v2/accounts/{account_id}/quota")
 async def get_account_quota(account_id: str, _: bool = Depends(verify_admin_key)):
     """获取 Gemini 账号配额信息"""

@@ -172,6 +172,7 @@
         <button class="btn-danger" onclick="batchDelete()" id="batch_delete_btn" style="display:none">删除选中</button>
         <button class="btn-warning" onclick="testSelectedAccounts()" id="test_selected_btn" style="display:none">测试选中</button>
         <button class="btn-warning" onclick="testAllAccounts()">测试所有账号</button>
+        <button class="btn-warning" onclick="refreshAllTokens()">批量刷新 Token</button>
         <input id="test_message" placeholder="测试消息" value="Hello" style="max-width:200px" />
         <div id="test_status" class="chip" style="display:none"></div>
       </div>
@@ -1119,6 +1120,51 @@ async function testAllAccounts() {
 
   setTestStatus(`完成: ${success} 成功, ${failed} 失败`, failed === 0);
   document.getElementById('test_results').innerHTML = results.join('');
+}
+
+async function refreshAllTokens() {
+  if (!confirm('确认批量刷新所有 Amazon Q 账号的 Token？这将检测出所有被封禁的账号。')) {
+    return;
+  }
+
+  setTestStatus('正在批量刷新 Token...', true);
+  document.getElementById('test_results').innerHTML = '';
+
+  try {
+    const r = await authFetch('/v2/accounts/refresh-all', { method: 'POST' });
+    if (!r.ok) throw new Error(await r.text());
+
+    const data = await r.json();
+
+    // 显示结果统计
+    setTestStatus(data.message, data.banned_count === 0);
+
+    // 显示详细结果
+    const results = [];
+    for (const result of data.results) {
+      let color, icon;
+      if (result.status === 'success') {
+        color = 'var(--success)';
+        icon = '✓';
+      } else if (result.status === 'banned') {
+        color = 'var(--danger)';
+        icon = '⚠️';
+      } else {
+        color = 'var(--warning)';
+        icon = '✗';
+      }
+
+      results.push(`<div class="card"><div style="color:${color}">${icon} ${result.label}</div><div style="font-size:12px;margin-top:8px;color:var(--muted)">${result.message}</div></div>`);
+    }
+
+    document.getElementById('test_results').innerHTML = results.join('');
+
+    // 刷新账号列表
+    await loadAccounts();
+  } catch(e) {
+    setTestStatus('批量刷新失败', false);
+    alert('批量刷新失败：' + e.message);
+  }
 }
 
 window.addEventListener('DOMContentLoaded', () => {
