@@ -77,6 +77,9 @@ def convert_claude_to_gemini(claude_req: ClaudeRequest, project: str) -> Dict[st
             "parts": parts
         })
 
+    # 重新组织消息，确保 tool_use 后紧跟对应的 tool_result
+    contents = reorganize_tool_messages(contents)
+
     # 构建 Gemini 请求
     gemini_request = {
         "project": project,
@@ -164,6 +167,117 @@ def map_claude_model_to_gemini(claude_model: str) -> str:
     }
 
     return model_mapping.get(claude_model, "claude-sonnet-4-5")
+
+
+def reorganize_tool_messages(contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    重新组织消息，确保每个 tool_use 后紧跟对应的 tool_result
+
+    Gemini 要求：每个 functionCall 后必须紧跟对应的 functionResponse
+    Claude Code 可能发送：
+    1. 一条 model 消息，parts 包含多个 functionCall
+    2. 下一条 user 消息，parts 包含多个 functionResponse
+
+    需要重新组织为：
+    1. model 消息，parts 包含 functionCall
+    2. user 消息，parts 包含对应的 functionResponse
+    3. model 消息，parts 包含下一个 functionCall
+    4. user 消息，parts 包含对应的 functionResponse
+    ...
+
+    Args:
+        contents: 原始消息列表
+
+    Returns:
+        重新组织后的消息列表
+    """
+    # 收集所有 tool_use 和 tool_result
+    tool_uses = {}  # {tool_id: (msg_index, part_index, tool_use_data)}
+    tool_results = {}  # {tool_id: (msg_index, part_index, tool_result_data)}
+
+    for msg_idx, msg in enumerate(contents):
+        for part_idx, part in enumerate(msg.get("parts", [])):
+            if "functionCall" in part:
+                tool_id = part["functionCall"].get("id")
+                if tool_id:
+                    tool_uses[tool_id] = (msg_idx, part_idx, part)
+            elif "functionResponse" in part:
+                tool_id = part["functionResponse"].get("id")
+                if tool_id:
+                    tool_results[tool_id] = (msg_idx, part_idx, part)
+
+    # 找出配对的 tool_use 和 tool_result
+    paired_tool_ids = set(tool_uses.keys()) & set(tool_results.keys())
+
+    # 如果没有工具调用，直接返回
+    if not paired_tool_ids:
+        logger.info("没有找到需要重新组织的工具调用")
+        return contents
+
+    logger.info(f"找到 {len(paired_tool_ids)} 对配对的工具调用")
+
+    # 重新构建消息列表
+    new_contents = []
+    processed_indices = set()  # 记录已处理的消息索引
+
+    for msg_idx, msg in enumerate(contents):
+        # 检查这条消息是否包含 tool_use
+        msg_tool_uses = []
+        other_parts = []
+
+        for part in msg.get("parts", []):
+            if "functionCall" in part:
+                tool_id = part["functionCall"].get("id")
+                if tool_id in paired_tool_ids:
+                    msg_tool_uses.append((tool_id, part))
+                else:
+                    # 没有配对的 tool_use，清理掉
+                    logger.warning(f"清理没有配对的 tool_use: {tool_id}")
+            elif "functionResponse" in part:
+                tool_id = part["functionResponse"].get("id")
+                if tool_id not in paired_tool_ids:
+                    # 没有配对的 tool_result，清理掉
+                    logger.warning(f"清理没有配对的 tool_result: {tool_id}")
+            else:
+                other_parts.append(part)
+
+        # 如果这条消息包含 tool_use
+        if msg_tool_uses:
+            # 先添加非工具调用的部分（如果有）
+            if other_parts:
+                new_contents.append({
+                    "role": msg["role"],
+                    "parts": other_parts
+                })
+
+            # 为每个 tool_use 创建一对消息
+            for tool_id, tool_use_part in msg_tool_uses:
+                # 添加 tool_use 消息
+                new_contents.append({
+                    "role": "model",
+                    "parts": [tool_use_part]
+                })
+
+                # 添加对应的 tool_result 消息
+                if tool_id in tool_results:
+                    _, _, tool_result_part = tool_results[tool_id]
+                    new_contents.append({
+                        "role": "user",
+                        "parts": [tool_result_part]
+                    })
+
+            processed_indices.add(msg_idx)
+        elif any("functionResponse" in part for part in msg.get("parts", [])):
+            # 这条消息只包含 tool_result，已经在上面处理过了
+            processed_indices.add(msg_idx)
+        else:
+            # 普通消息，直接添加
+            if msg_idx not in processed_indices:
+                new_contents.append(msg)
+                processed_indices.add(msg_idx)
+
+    logger.info(f"重新组织后的消息数量: {len(new_contents)}")
+    return new_contents
 
 
 def convert_tools(claude_tools: List[Any]) -> List[Dict[str, Any]]:
