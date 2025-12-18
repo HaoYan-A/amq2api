@@ -147,7 +147,7 @@
 <body>
   <div class="container">
     <h1>账号管理</h1>
-    <p style="color: var(--muted); margin-bottom: 32px;">管理 Amazon Q 和 Gemini 账号</p>
+    <p style="color: var(--muted); margin-bottom: 32px;">管理 Amazon Q、Gemini 和 Antigravity 账号</p>
 
     <div class="panel">
       <h2>系统状态</h2>
@@ -165,6 +165,7 @@
           <option value="all">全部类型</option>
           <option value="amazonq">Amazon Q</option>
           <option value="gemini">Gemini</option>
+          <option value="antigravity">Antigravity</option>
         </select>
         <input id="filter_start_date" type="date" onchange="applyFilters()" placeholder="开始日期" style="max-width:150px" />
         <input id="filter_end_date" type="date" onchange="applyFilters()" placeholder="结束日期" style="max-width:150px" />
@@ -196,6 +197,7 @@
           <select id="new_type" onchange="toggleAccountFields()">
             <option value="amazonq">Amazon Q</option>
             <option value="gemini">Gemini</option>
+            <option value="antigravity">Antigravity</option>
           </select>
         </div>
         <div class="field">
@@ -235,6 +237,18 @@
           </div>
         </div>
       </div>
+      <div id="antigravity_fields" style="display:none">
+        <div class="row">
+          <div class="field">
+            <label>Project ID (可选)</label>
+            <input id="new_antigravity_project" placeholder="GCP 项目 ID，留空自动获取" />
+          </div>
+          <div class="field">
+            <label>Email (可选)</label>
+            <input id="new_antigravity_email" placeholder="Google 账号邮箱" />
+          </div>
+        </div>
+      </div>
       <div class="row" style="margin-top:12px">
         <label class="switch">
           <input id="new_enabled" type="checkbox" checked />
@@ -242,6 +256,25 @@
         </label>
         <label style="color: var(--text)">启用账号</label>
         <button onclick="createAccount()">创建账号</button>
+      </div>
+
+      <div class="divider"></div>
+
+      <h3>快捷添加账号</h3>
+      <div class="row">
+        <button class="btn-secondary" onclick="donateAntigravity()">通过 Google OAuth 添加 Antigravity</button>
+      </div>
+
+      <div style="margin-top: 20px; padding: 16px; background: var(--bg); border-radius: 12px; border: 1px solid var(--border);">
+        <h4 style="margin: 0 0 12px 0; font-size: 14px; color: var(--text);">手动提交授权链接</h4>
+        <p style="margin: 0 0 12px 0; font-size: 13px; color: var(--muted);">如果弹出窗口被阻止或授权后出现错误，可以手动粘贴授权完成后的完整 URL</p>
+        <p style="margin: 0 0 12px 0; font-size: 12px; color: var(--muted);">示例: http://localhost:51121/oauth-callback?state=xxx&code=xxx</p>
+        <div class="row">
+          <div class="field" style="flex: 1;">
+            <input id="manual_antigravity_url" type="text" placeholder="粘贴授权完成后的完整 URL..." />
+          </div>
+          <button class="btn-secondary" onclick="submitManualAntigravityUrl()">提交</button>
+        </div>
       </div>
 
       <div class="divider"></div>
@@ -254,6 +287,7 @@
             <option value="full">完整格式</option>
             <option value="amazonq">Amazon Q 简化</option>
             <option value="gemini">Gemini 简化</option>
+            <option value="antigravity">Antigravity 简化</option>
           </select>
         </div>
       </div>
@@ -294,6 +328,7 @@ function authFetch(url, options = {}) {
 function toggleAccountFields() {
   const type = document.getElementById('new_type').value;
   document.getElementById('gemini_fields').style.display = type === 'gemini' ? 'block' : 'none';
+  document.getElementById('antigravity_fields').style.display = type === 'antigravity' ? 'block' : 'none';
 }
 
 function toggleImportFormat() {
@@ -307,6 +342,9 @@ function toggleImportFormat() {
   } else if (type === 'gemini') {
     label.textContent = '账号数据（每行格式：label|clientId|clientSecret|refreshToken|accessToken|project|api_endpoint）';
     textarea.placeholder = '我的账号|client_id|client_secret|refresh_token|access_token|project_id|api_endpoint';
+  } else if (type === 'antigravity') {
+    label.textContent = '账号数据（每行格式：label|clientId|clientSecret|refreshToken|accessToken|project|email）';
+    textarea.placeholder = '我的账号|client_id|client_secret|refresh_token|access_token|project_id|email@example.com';
   } else {
     label.textContent = '账号数据（每行格式：type|label|clientId|clientSecret|refreshToken|accessToken|project|api_endpoint）';
     textarea.placeholder = 'amazonq|我的账号|client_id|client_secret|refresh_token|access_token||';
@@ -376,7 +414,12 @@ function renderAccounts(list) {
 
     const typeChip = document.createElement('span');
     typeChip.className = `chip ${acc.type || 'amazonq'}`;
-    typeChip.textContent = acc.type === 'gemini' ? 'Gemini' : 'Amazon Q';
+    const typeNames = {
+      'gemini': 'Gemini',
+      'amazonq': 'Amazon Q',
+      'antigravity': 'Antigravity'
+    };
+    typeChip.textContent = typeNames[acc.type] || 'Amazon Q';
 
     const idChip = document.createElement('span');
     idChip.className = 'chip mono';
@@ -430,6 +473,10 @@ function renderAccounts(list) {
     row('Client ID', acc.clientId);
     if (acc.type === 'gemini' && other.project) {
       row('Project ID', other.project);
+    }
+    if (acc.type === 'antigravity') {
+      if (other.project) row('Project ID', other.project);
+      if (other.email) row('Email', other.email);
     }
     card.appendChild(meta);
 
@@ -591,6 +638,12 @@ async function createAccount() {
     const api_endpoint = document.getElementById('new_api_endpoint').value.trim();
     if (project) other.project = project;
     if (api_endpoint) other.api_endpoint = api_endpoint;
+  } else if (type === 'antigravity') {
+    const project = document.getElementById('new_antigravity_project').value.trim();
+    const email = document.getElementById('new_antigravity_email').value.trim();
+    if (project) other.project = project;
+    if (email) other.email = email;
+    other.api_endpoint = 'https://cloudaicompanion.googleapis.com';
   }
 
   const body = {
@@ -620,6 +673,8 @@ async function createAccount() {
     document.getElementById('new_accessToken').value = '';
     document.getElementById('new_project').value = '';
     document.getElementById('new_api_endpoint').value = '';
+    document.getElementById('new_antigravity_project').value = '';
+    document.getElementById('new_antigravity_email').value = '';
   } catch(e) {
     alert('创建失败：' + e);
   }
@@ -782,7 +837,7 @@ async function importAccounts() {
     const line = lines[i].trim();
     const parts = line.split('|').map(p => p.trim());
 
-    let type, label, clientId, clientSecret, refreshToken, accessToken, project, api_endpoint;
+    let type, label, clientId, clientSecret, refreshToken, accessToken, project, api_endpoint, email;
 
     if (importType === 'amazonq') {
       if (parts.length < 6) {
@@ -792,9 +847,9 @@ async function importAccounts() {
         continue;
       }
       // email|password|clientId|clientSecret|refreshToken|accessToken
-      const [email, password, ...rest] = parts;
+      const [emailField, password, ...rest] = parts;
       [clientId, clientSecret, refreshToken, accessToken] = rest;
-      label = email; // 使用 email 作为 label
+      label = emailField; // 使用 email 作为 label
       type = 'amazonq';
     } else if (importType === 'gemini') {
       if (parts.length < 5) {
@@ -804,6 +859,15 @@ async function importAccounts() {
       }
       [label, clientId, clientSecret, refreshToken, accessToken, project, api_endpoint] = parts;
       type = 'gemini';
+    } else if (importType === 'antigravity') {
+      if (parts.length < 5) {
+        setImportStatus(`第 ${i+1} 行格式错误`, false);
+        failed++;
+        continue;
+      }
+      // label|clientId|clientSecret|refreshToken|accessToken|project|email
+      [label, clientId, clientSecret, refreshToken, accessToken, project, email] = parts;
+      type = 'antigravity';
     } else {
       if (parts.length < 6) {
         setImportStatus(`第 ${i+1} 行格式错误`, false);
@@ -816,6 +880,10 @@ async function importAccounts() {
     const other = {};
     if (project) other.project = project;
     if (api_endpoint) other.api_endpoint = api_endpoint;
+    if (email) other.email = email;
+    if (type === 'antigravity' && !api_endpoint) {
+      other.api_endpoint = 'https://cloudaicompanion.googleapis.com';
+    }
 
     try {
       const r = await authFetch('/v2/accounts', {
@@ -872,6 +940,10 @@ async function exportAccounts() {
 
     const lines = accounts.map(acc => {
       const other = acc.other || {};
+      // 对于 antigravity 类型，使用 email 而不是 api_endpoint
+      if (acc.type === 'antigravity') {
+        return `${acc.type}|${acc.label || ''}|${acc.clientId}|${acc.clientSecret}|${acc.refreshToken || ''}|${acc.accessToken || ''}|${other.project || ''}|${other.email || ''}`;
+      }
       return `${acc.type || 'amazonq'}|${acc.label || ''}|${acc.clientId}|${acc.clientSecret}|${acc.refreshToken || ''}|${acc.accessToken || ''}|${other.project || ''}|${other.api_endpoint || ''}`;
     });
 
@@ -902,7 +974,12 @@ async function testSingleAccount(accountId) {
   document.getElementById('test_results').innerHTML = '';
 
   try {
-    const endpoint = acc.type === 'gemini' ? '/v1/gemini/messages' : '/v1/messages';
+    const endpoints = {
+      'gemini': '/v1/gemini/messages',
+      'antigravity': '/v1/antigravity/messages',
+      'amazonq': '/v1/messages'
+    };
+    const endpoint = endpoints[acc.type] || '/v1/messages';
     const headers = {
       'content-type': 'application/json',
       'X-Account-ID': accountId
@@ -914,7 +991,11 @@ async function testSingleAccount(accountId) {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        model: acc.type === 'gemini' ? 'gemini-3-pro-high' : 'claude-sonnet-4',
+        model: {
+          'gemini': 'gemini-3-pro-high',
+          'antigravity': 'claude-sonnet-4.5',
+          'amazonq': 'claude-sonnet-4'
+        }[acc.type] || 'claude-sonnet-4',
         max_tokens: 50,
         messages: [{ role: 'user', content: msg }]
       })
@@ -978,7 +1059,12 @@ async function testSelectedAccounts() {
 
   for (const acc of toTest) {
     try {
-      const endpoint = acc.type === 'gemini' ? '/v1/gemini/messages' : '/v1/messages';
+      const endpoints = {
+        'gemini': '/v1/gemini/messages',
+        'antigravity': '/v1/antigravity/messages',
+        'amazonq': '/v1/messages'
+      };
+      const endpoint = endpoints[acc.type] || '/v1/messages';
       const headers = {
         'content-type': 'application/json',
         'X-Account-ID': acc.id
@@ -990,7 +1076,11 @@ async function testSelectedAccounts() {
         method: 'POST',
         headers,
         body: JSON.stringify({
-          model: acc.type === 'gemini' ? 'gemini-3-pro-high' : 'claude-sonnet-4',
+          model: {
+            'gemini': 'gemini-3-pro-high',
+            'antigravity': 'claude-sonnet-4.5',
+            'amazonq': 'claude-sonnet-4'
+          }[acc.type] || 'claude-sonnet-4',
           max_tokens: 50,
           messages: [{ role: 'user', content: msg }]
         })
@@ -1059,7 +1149,12 @@ async function testAllAccounts() {
 
   for (const acc of enabled) {
     try {
-      const endpoint = acc.type === 'gemini' ? '/v1/gemini/messages' : '/v1/messages';
+      const endpoints = {
+        'gemini': '/v1/gemini/messages',
+        'antigravity': '/v1/antigravity/messages',
+        'amazonq': '/v1/messages'
+      };
+      const endpoint = endpoints[acc.type] || '/v1/messages';
       const headers = {
         'content-type': 'application/json',
         'X-Account-ID': acc.id
@@ -1071,7 +1166,11 @@ async function testAllAccounts() {
         method: 'POST',
         headers,
         body: JSON.stringify({
-          model: acc.type === 'gemini' ? 'gemini-3-pro-high' : 'claude-sonnet-4',
+          model: {
+            'gemini': 'gemini-3-pro-high',
+            'antigravity': 'claude-sonnet-4.5',
+            'amazonq': 'claude-sonnet-4'
+          }[acc.type] || 'claude-sonnet-4',
           max_tokens: 50,
           messages: [{ role: 'user', content: msg }]
         })
@@ -1164,6 +1263,124 @@ async function refreshAllTokens() {
   } catch(e) {
     setTestStatus('批量刷新失败', false);
     alert('批量刷新失败：' + e.message);
+  }
+}
+
+// OAuth 授权流程 - Antigravity
+let currentAntigravityAuthState = null;
+
+async function donateAntigravity() {
+  try {
+    // 从后端获取 OAuth URL
+    const response = await fetch('/api/antigravity/auth-url');
+    if (!response.ok) {
+      throw new Error('获取授权链接失败');
+    }
+
+    const data = await response.json();
+    const authUrl = data.url;
+    currentAntigravityAuthState = data.state;
+
+    // 打开弹出窗口
+    const width = 600;
+    const height = 700;
+    const left = (screen.width - width) / 2;
+    const top = (screen.height - height) / 2;
+    const popup = window.open(
+      authUrl,
+      'OAuth Authorization',
+      `width=${width},height=${height},left=${left},top=${top},toolbar=no,menubar=no,location=no,status=no`
+    );
+
+    if (!popup) {
+      alert('弹出窗口被阻止，请允许弹出窗口后重试');
+      return;
+    }
+
+    // 监听来自弹出窗口的消息
+    window.addEventListener('message', handleAntigravityOAuthMessage);
+
+  } catch (error) {
+    alert('启动授权失败：' + error.message);
+  }
+}
+
+async function handleAntigravityOAuthMessage(event) {
+  // 验证消息来源
+  if (event.origin !== window.location.origin) {
+    return;
+  }
+
+  const { type, code, state, error } = event.data;
+
+  if (type === 'oauth-error') {
+    alert('授权失败：' + error);
+    window.removeEventListener('message', handleAntigravityOAuthMessage);
+    return;
+  }
+
+  if (type === 'oauth-success' && code) {
+    await submitAntigravityAuthCode(code, state || currentAntigravityAuthState);
+    window.removeEventListener('message', handleAntigravityOAuthMessage);
+  }
+}
+
+async function submitAntigravityAuthCode(code, state) {
+  try {
+    const response = await authFetch('/api/antigravity/oauth-callback', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ code, state })
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.detail || '提交失败');
+    }
+
+    const result = await response.json();
+    alert(`Antigravity 账号添加成功！\n邮箱: ${result.email || 'N/A'}\n项目: ${result.project_id || 'N/A'}`);
+
+    // 刷新账号列表
+    await loadAccounts();
+
+  } catch (err) {
+    alert('添加失败：' + err.message);
+  }
+}
+
+async function submitManualAntigravityUrl() {
+  const input = document.getElementById('manual_antigravity_url');
+  const url = input.value.trim();
+
+  if (!url) {
+    alert('请输入授权完成后的 URL');
+    return;
+  }
+
+  try {
+    // 解析 URL 提取 code 和 state 参数
+    const urlObj = new URL(url);
+    const code = urlObj.searchParams.get('code');
+    const state = urlObj.searchParams.get('state');
+
+    if (!code) {
+      throw new Error('URL 中未找到授权码 (code 参数)');
+    }
+    if (!state) {
+      throw new Error('URL 中未找到 state 参数');
+    }
+
+    // 提交授权码
+    await submitAntigravityAuthCode(code, state);
+
+    // 清空输入框
+    input.value = '';
+
+  } catch (err) {
+    alert('提交失败：' + err.message);
   }
 }
 

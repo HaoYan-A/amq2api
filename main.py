@@ -1253,14 +1253,11 @@ async def donate_page():
 
 
 # Antigravity 投喂站页面
-@app.get("/donate-antigravity", response_class=FileResponse)
-async def donate_antigravity_page():
-    """Antigravity 投喂站页面"""
-    from pathlib import Path
-    frontend_path = Path(__file__).parent / "frontend" / "donate-antigravity.html"
-    if not frontend_path.exists():
-        raise HTTPException(status_code=404, detail="Antigravity 投喂站页面不存在")
-    return FileResponse(str(frontend_path))
+@app.get("/donate-antigravity")
+async def donate_antigravity_redirect():
+    """Antigravity 投喂站重定向到管理界面"""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/admin", status_code=301)
 
 
 # Antigravity OAuth 授权 URL 生成
