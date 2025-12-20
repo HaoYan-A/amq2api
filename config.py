@@ -4,12 +4,15 @@
 """
 import os
 import json
+import logging
 import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # 加载环境变量
 load_dotenv()
@@ -73,7 +76,7 @@ def _load_token_cache() -> Optional[dict]:
                     if datetime.now() < expires_at:
                         return cache
     except Exception as e:
-        print(f"加载 token 缓存失败: {e}")
+        logger.warning(f"加载 token 缓存失败: {e}")
     return None
 
 
@@ -90,7 +93,7 @@ def _save_token_cache(access_token: str, refresh_token: str, expires_at: datetim
         # 设置文件权限为仅当前用户可读写
         TOKEN_CACHE_FILE.chmod(0o600)
     except Exception as e:
-        print(f"保存 token 缓存失败: {e}")
+        logger.warning(f"保存 token 缓存失败: {e}")
 
 
 async def read_global_config() -> GlobalConfig:
@@ -134,7 +137,7 @@ async def read_global_config() -> GlobalConfig:
                 _global_config.access_token = cache.get('access_token')
                 _global_config.refresh_token = cache.get('refresh_token', _global_config.refresh_token)
                 _global_config.token_expires_at = datetime.fromisoformat(cache['expires_at'])
-                print(f"从缓存加载 token，过期时间: {_global_config.token_expires_at}")
+                logger.info(f"从缓存加载 token，过期时间: {_global_config.token_expires_at}")
 
         return _global_config
 
@@ -174,7 +177,7 @@ async def update_global_config(
                 _global_config.refresh_token,
                 _global_config.token_expires_at
             )
-            print(f"Token 已保存到缓存文件: {TOKEN_CACHE_FILE}")
+            logger.info(f"Token 已保存到缓存文件: {TOKEN_CACHE_FILE}")
 
 
 def get_config_sync() -> GlobalConfig:

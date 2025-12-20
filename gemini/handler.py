@@ -279,4 +279,5 @@ def format_sse_event(event_type: str, data: dict) -> str:
     Returns:
         格式化的 SSE 事件字符串
     """
-    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    result = f"event: {event_type}\r\ndata: {json.dumps(data, ensure_ascii=False)}\r\n\r\n"
+    return result

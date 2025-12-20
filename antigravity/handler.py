@@ -2,6 +2,7 @@
 Antigravity 流式响应处理器
 将 Antigravity SSE 响应转换为 Claude SSE 格式
 """
+import asyncio
 import json
 import logging
 from typing import AsyncIterator
@@ -25,7 +26,7 @@ async def handle_antigravity_stream(
         session_id: 会话 ID（用于缓存签名）
 
     Yields:
-        Claude 格式的 SSE 事件
+        Claude 格式的 SSE 事件（字符串）
     """
     # 跟踪内容块和 token 统计
     content_blocks = []
@@ -81,13 +82,13 @@ async def handle_antigravity_stream(
                 if event_text.startswith('data: '):
                     data_str = event_text[6:]
                     if data_str.strip() == '[DONE]':
-                        logger.info("[Antigravity] 收到 [DONE] 标记")
+                        logger.debug("[Antigravity] 收到 [DONE] 标记")
                         continue
 
                     try:
                         data = json.loads(data_str)
                         response_data = data.get('response', data)
-                        logger.info(f"[Antigravity 响应] {json.dumps(response_data, ensure_ascii=False)[:500]}")
+                        logger.debug(f"[Antigravity 响应] {json.dumps(response_data, ensure_ascii=False)[:500]}")
 
                         # 提取 responseId
                         if 'responseId' in response_data:
@@ -118,7 +119,7 @@ async def handle_antigravity_stream(
                             usage_meta = response_data['usageMetadata']
                             input_tokens = usage_meta.get('promptTokenCount', 0)
                             output_tokens = usage_meta.get('candidatesTokenCount', 0)
-                            logger.info(f"[Antigravity Token] input={input_tokens}, output={output_tokens}")
+                            logger.debug(f"[Antigravity Token] input={input_tokens}, output={output_tokens}")
 
                         # 处理 candidates
                         if 'candidates' in response_data:
@@ -172,6 +173,7 @@ async def handle_antigravity_stream(
                                                 "index": current_index,
                                                 "delta": {"type": "thinking_delta", "thinking": thinking_text}
                                             })
+                                            await asyncio.sleep(0)  # 让出控制权
 
                                         # 处理签名
                                         if 'thoughtSignature' in part:
@@ -190,6 +192,7 @@ async def handle_antigravity_stream(
                                                     "index": current_index,
                                                     "delta": {"type": "signature_delta", "signature": signature}
                                                 })
+                                                await asyncio.sleep(0)  # 让出控制权
                                                 # 发送 content_block_stop
                                                 yield format_sse_event("content_block_stop", {
                                                     "type": "content_block_stop",
@@ -236,6 +239,7 @@ async def handle_antigravity_stream(
                                             "index": current_index,
                                             "delta": {"type": "text_delta", "text": text_content}
                                         })
+                                        await asyncio.sleep(0)  # 让出控制权
 
                                     # 处理工具调用
                                     elif 'functionCall' in part:
@@ -295,7 +299,7 @@ async def handle_antigravity_stream(
             logger.error(f"[Antigravity 异常] 处理流式响应时出错: {e}", exc_info=True)
             continue
 
-    logger.info(f"[Antigravity 流结束] 共处理 {chunk_count} 个 chunk")
+    logger.debug(f"[Antigravity 流结束] 共处理 {chunk_count} 个 chunk")
 
     # 处理 buffer 中剩余的数据
     if buffer.strip():
@@ -333,7 +337,7 @@ async def handle_antigravity_stream(
 
     # 关闭最后一个内容块
     if current_index >= 0 and content_block_started and not content_block_stop_sent:
-        logger.info(f"[Antigravity 结束] 关闭最后一个内容块 index={current_index}")
+        logger.debug(f"[Antigravity 结束] 关闭最后一个内容块 index={current_index}")
         yield format_sse_event("content_block_stop", {
             "type": "content_block_stop",
             "index": current_index
@@ -356,7 +360,7 @@ async def handle_antigravity_stream(
         })
 
     # 发送 message_delta 事件
-    logger.info(f"[Antigravity 结束] message_delta: input={input_tokens}, output={output_tokens}, stop_reason={finish_reason}")
+    logger.debug(f"[Antigravity 结束] message_delta: input={input_tokens}, output={output_tokens}, stop_reason={finish_reason}")
     yield format_sse_event("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": finish_reason, "stop_sequence": None},
@@ -364,7 +368,7 @@ async def handle_antigravity_stream(
     })
 
     # 发送 message_stop 事件
-    logger.info("[Antigravity 结束] message_stop")
+    logger.debug("[Antigravity 结束] message_stop")
     yield format_sse_event("message_stop", {
         "type": "message_stop"
     })
@@ -381,4 +385,10 @@ def format_sse_event(event_type: str, data: dict) -> str:
     Returns:
         格式化的 SSE 事件字符串
     """
-    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    json_data = json.dumps(data, ensure_ascii=False)
+    result = f"event: {event_type}\r\ndata: {json_data}\r\n\r\n"
+    # 确保返回的是字符串类型
+    if not isinstance(result, str):
+        logger.error(f"[format_sse_event] 类型错误: {type(result)}")
+        result = str(result)
+    return result

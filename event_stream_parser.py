@@ -163,7 +163,8 @@ class EventStreamParser:
                     if parse_errors >= max_errors:
                         logger.warning("切换到文本解析降级模式")
                         # 尝试在缓冲区中搜索 JSON payload
-                        yield from EventStreamParser._parse_text_fallback(buffer)
+                        for event in EventStreamParser._parse_text_fallback(buffer):
+                            yield event
                         buffer.clear()
                         parse_errors = 0
                     break
@@ -192,7 +193,8 @@ class EventStreamParser:
                     # 如果错误过多，切换到文本解析
                     if parse_errors >= max_errors:
                         logger.warning("切换到文本解析降级模式")
-                        yield from EventStreamParser._parse_text_fallback(buffer)
+                        for event in EventStreamParser._parse_text_fallback(buffer):
+                            yield event
                         buffer.clear()
                         parse_errors = 0
 

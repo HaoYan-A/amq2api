@@ -58,6 +58,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Antigravity 账号级限流（每个账号同时只能处理一个请求）
+# ============================================================================
+import asyncio
+from typing import Dict as TypingDict
+
+_antigravity_locks: TypingDict[str, asyncio.Lock] = {}
+_antigravity_locks_lock = asyncio.Lock()
+
+
+async def get_antigravity_account_lock(account_id: str) -> asyncio.Lock:
+    """获取指定 Antigravity 账号的锁（如果不存在则创建）"""
+    async with _antigravity_locks_lock:
+        if account_id not in _antigravity_locks:
+            _antigravity_locks[account_id] = asyncio.Lock()
+            logger.debug(f"[Antigravity 限流] 为账号 {account_id} 创建锁")
+        return _antigravity_locks[account_id]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
@@ -219,7 +238,7 @@ async def create_message(request: Request, _: bool = Depends(verify_api_key)):
                 logger.info(f"指定账号为 Gemini 类型，转发到 Gemini 渠道")
                 return await create_gemini_message(request)
             elif account_type == 'antigravity':
-                logger.info(f"指定账号为 Antigravity 类型，转发到 Antigravity 渠道")
+                logger.debug(f"指定账号为 Antigravity 类型，转发到 Antigravity 渠道")
                 return await create_antigravity_message(request)
         else:
             # 没有指定账号时，根据模型智能选择渠道
@@ -228,7 +247,7 @@ async def create_message(request: Request, _: bool = Depends(verify_api_key)):
             if not channel:
                 raise HTTPException(status_code=503, detail="没有可用的账号")
 
-            logger.info(f"智能路由选择渠道: {channel}")
+            logger.debug(f"智能路由选择渠道: {channel}")
 
             # 如果选择了 Gemini 渠道，转发到 /v1/gemini/messages
             if channel == 'gemini':
@@ -366,145 +385,159 @@ async def create_message(request: Request, _: bool = Depends(verify_api_key)):
         # API URL
         api_url = "https://q.us-east-1.amazonaws.com/"
 
-        # 创建字节流响应（支持 401/403 重试）
+        # 创建字节流响应（支持 401/403 重试和网络错误重试）
         async def byte_stream():
+            max_retries = 3  # 最大重试次数
+            retry_delay = 1  # 重试延迟（秒）
+
             async with httpx.AsyncClient(timeout=300.0) as client:
-                try:
-                    async with client.stream(
-                        "POST",
-                        api_url,
-                        json=final_request,
-                        headers=auth_headers
-                    ) as response:
-                        # 检查响应状态
-                        if response.status_code in (401, 403):
-                            # 401/403 错误：刷新 token 并重试
-                            logger.warning(f"收到 {response.status_code} 错误，尝试刷新 token 并重试")
-                            error_text = await response.aread()
-                            error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
-                            logger.error(f"原始错误: {error_str}")
+                for attempt in range(max_retries):
+                    try:
+                        async with client.stream(
+                            "POST",
+                            api_url,
+                            json=final_request,
+                            headers=auth_headers
+                        ) as response:
+                            # 检查响应状态
+                            if response.status_code in (401, 403):
+                                # 401/403 错误：刷新 token 并重试
+                                logger.warning(f"收到 {response.status_code} 错误，尝试刷新 token 并重试")
+                                error_text = await response.aread()
+                                error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
+                                logger.error(f"原始错误: {error_str}")
 
-                            # 检测账号是否被封
-                            if "TEMPORARILY_SUSPENDED" in error_str and account:
-                                logger.error(f"账号 {account['id']} 已被封禁，自动禁用")
-                                from datetime import datetime
-                                suspend_info = {
-                                    "suspended": True,
-                                    "suspended_at": datetime.now().isoformat(),
-                                    "suspend_reason": "TEMPORARILY_SUSPENDED"
-                                }
-                                current_other = account.get('other') or {}
-                                current_other.update(suspend_info)
-                                update_account(account['id'], enabled=False, other=current_other)
-
-                                # 如果不是指定账号，抛出 TokenRefreshError 让外层重试
-                                if not specified_account_id:
-                                    raise TokenRefreshError(f"账号已被封禁: {error_str}")
-                                else:
-                                    raise HTTPException(status_code=403, detail=f"账号已被封禁: {error_str}")
-
-                            try:
-                                # 刷新 token（支持多账号和单账号模式）
-                                if account:
-                                    # 多账号模式：刷新当前账号
-                                    refreshed_account = await refresh_account_token(account)
-                                    new_access_token = refreshed_account.get("accessToken")
-                                else:
-                                    # 单账号模式：刷新 .env 配置的 token
-                                    from auth import refresh_legacy_token
-                                    await refresh_legacy_token()
-                                    from config import read_global_config
-                                    config = await read_global_config()
-                                    new_access_token = config.access_token
-
-                                if not new_access_token:
-                                    raise HTTPException(status_code=502, detail="Token 刷新后仍无法获取 accessToken")
-
-                                # 更新认证头
-                                auth_headers["Authorization"] = f"Bearer {new_access_token}"
-
-                                # 使用新 token 重试
-                                async with client.stream(
-                                    "POST",
-                                    api_url,
-                                    json=final_request,
-                                    headers=auth_headers
-                                ) as retry_response:
-                                    if retry_response.status_code != 200:
-                                        retry_error = await retry_response.aread()
-                                        retry_error_str = retry_error.decode() if isinstance(retry_error, bytes) else str(retry_error)
-                                        logger.error(f"重试后仍失败: {retry_response.status_code} {retry_error_str}")
-
-                                        # 重试后仍然失败，检测是否被封
-                                        if retry_response.status_code == 403 and "TEMPORARILY_SUSPENDED" in retry_error_str and account:
-                                            logger.error(f"账号 {account['id']} 已被封禁，自动禁用")
-                                            from datetime import datetime
-                                            suspend_info = {
-                                                "suspended": True,
-                                                "suspended_at": datetime.now().isoformat(),
-                                                "suspend_reason": "TEMPORARILY_SUSPENDED"
-                                            }
-                                            current_other = account.get('other') or {}
-                                            current_other.update(suspend_info)
-                                            update_account(account['id'], enabled=False, other=current_other)
-
-                                        raise HTTPException(
-                                            status_code=retry_response.status_code,
-                                            detail=f"重试后仍失败: {retry_error_str}"
-                                        )
-
-                                    # 重试成功，返回数据流
-                                    async for chunk in retry_response.aiter_bytes():
-                                        if chunk:
-                                            yield chunk
-                                    return
-
-                            except TokenRefreshError as e:
-                                logger.error(f"Token 刷新失败: {e}")
-                                raise HTTPException(status_code=502, detail=f"Token 刷新失败: {str(e)}")
-
-                        elif response.status_code != 200:
-                            error_text = await response.aread()
-                            error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
-                            logger.error(f"上游 API 错误: {response.status_code} {error_str}")
-
-                            # 检测月度配额用完错误
-                            if "ThrottlingException" in error_str and "MONTHLY_REQUEST_COUNT" in error_str:
-                                logger.error(f"账号 {account.get('id') if account else 'legacy'} 月度配额已用完")
-                                if account:
-                                    # 多账号模式：禁用该账号
+                                # 检测账号是否被封
+                                if "TEMPORARILY_SUSPENDED" in error_str and account:
+                                    logger.error(f"账号 {account['id']} 已被封禁，自动禁用")
                                     from datetime import datetime
-                                    quota_info = {
-                                        "monthly_quota_exhausted": True,
-                                        "exhausted_at": datetime.now().isoformat()
+                                    suspend_info = {
+                                        "suspended": True,
+                                        "suspended_at": datetime.now().isoformat(),
+                                        "suspend_reason": "TEMPORARILY_SUSPENDED"
                                     }
                                     current_other = account.get('other') or {}
-                                    current_other.update(quota_info)
+                                    current_other.update(suspend_info)
                                     update_account(account['id'], enabled=False, other=current_other)
-                                    raise HTTPException(
-                                        status_code=429,
-                                        detail="账号月度配额已用完，已自动禁用该账号。请等待下月重置或添加新账号。"
-                                    )
-                                else:
-                                    # 单账号模式
-                                    raise HTTPException(
-                                        status_code=429,
-                                        detail="Amazon Q 月度配额已用完，请等待下月重置。"
-                                    )
 
-                            raise HTTPException(
-                                status_code=response.status_code,
-                                detail=f"上游 API 错误: {error_str}"
-                            )
+                                    # 如果不是指定账号，抛出 TokenRefreshError 让外层重试
+                                    if not specified_account_id:
+                                        raise TokenRefreshError(f"账号已被封禁: {error_str}")
+                                    else:
+                                        raise HTTPException(status_code=403, detail=f"账号已被封禁: {error_str}")
 
-                        # 正常响应，处理 Event Stream（字节流）
-                        async for chunk in response.aiter_bytes():
-                            if chunk:
-                                yield chunk
+                                try:
+                                    # 刷新 token（支持多账号和单账号模式）
+                                    if account:
+                                        # 多账号模式：刷新当前账号
+                                        refreshed_account = await refresh_account_token(account)
+                                        new_access_token = refreshed_account.get("accessToken")
+                                    else:
+                                        # 单账号模式：刷新 .env 配置的 token
+                                        from auth import refresh_legacy_token
+                                        await refresh_legacy_token()
+                                        from config import read_global_config
+                                        config = await read_global_config()
+                                        new_access_token = config.access_token
 
-                except httpx.RequestError as e:
-                    logger.error(f"请求错误: {e}")
-                    raise HTTPException(status_code=502, detail=f"上游服务错误: {str(e)}")
+                                    if not new_access_token:
+                                        raise HTTPException(status_code=502, detail="Token 刷新后仍无法获取 accessToken")
+
+                                    # 更新认证头
+                                    auth_headers["Authorization"] = f"Bearer {new_access_token}"
+
+                                    # 使用新 token 重试
+                                    async with client.stream(
+                                        "POST",
+                                        api_url,
+                                        json=final_request,
+                                        headers=auth_headers
+                                    ) as retry_response:
+                                        if retry_response.status_code != 200:
+                                            retry_error = await retry_response.aread()
+                                            retry_error_str = retry_error.decode() if isinstance(retry_error, bytes) else str(retry_error)
+                                            logger.error(f"重试后仍失败: {retry_response.status_code} {retry_error_str}")
+
+                                            # 重试后仍然失败，检测是否被封
+                                            if retry_response.status_code == 403 and "TEMPORARILY_SUSPENDED" in retry_error_str and account:
+                                                logger.error(f"账号 {account['id']} 已被封禁，自动禁用")
+                                                from datetime import datetime
+                                                suspend_info = {
+                                                    "suspended": True,
+                                                    "suspended_at": datetime.now().isoformat(),
+                                                    "suspend_reason": "TEMPORARILY_SUSPENDED"
+                                                }
+                                                current_other = account.get('other') or {}
+                                                current_other.update(suspend_info)
+                                                update_account(account['id'], enabled=False, other=current_other)
+
+                                            raise HTTPException(
+                                                status_code=retry_response.status_code,
+                                                detail=f"重试后仍失败: {retry_error_str}"
+                                            )
+
+                                        # 重试成功，返回数据流
+                                        async for chunk in retry_response.aiter_bytes():
+                                            if chunk:
+                                                yield chunk
+                                        return
+
+                                except TokenRefreshError as e:
+                                    logger.error(f"Token 刷新失败: {e}")
+                                    raise HTTPException(status_code=502, detail=f"Token 刷新失败: {str(e)}")
+
+                            elif response.status_code != 200:
+                                error_text = await response.aread()
+                                error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
+                                logger.error(f"上游 API 错误: {response.status_code} {error_str}")
+
+                                # 检测月度配额用完错误
+                                if "ThrottlingException" in error_str and "MONTHLY_REQUEST_COUNT" in error_str:
+                                    logger.error(f"账号 {account.get('id') if account else 'legacy'} 月度配额已用完")
+                                    if account:
+                                        # 多账号模式：禁用该账号
+                                        from datetime import datetime
+                                        quota_info = {
+                                            "monthly_quota_exhausted": True,
+                                            "exhausted_at": datetime.now().isoformat()
+                                        }
+                                        current_other = account.get('other') or {}
+                                        current_other.update(quota_info)
+                                        update_account(account['id'], enabled=False, other=current_other)
+                                        raise HTTPException(
+                                            status_code=429,
+                                            detail="账号月度配额已用完，已自动禁用该账号。请等待下月重置或添加新账号。"
+                                        )
+                                    else:
+                                        # 单账号模式
+                                        raise HTTPException(
+                                            status_code=429,
+                                            detail="Amazon Q 月度配额已用完，请等待下月重置。"
+                                        )
+
+                                raise HTTPException(
+                                    status_code=response.status_code,
+                                    detail=f"上游 API 错误: {error_str}"
+                                )
+
+                            # 正常响应，处理 Event Stream（字节流）
+                            async for chunk in response.aiter_bytes():
+                                if chunk:
+                                    yield chunk
+                            return  # 成功完成，退出重试循环
+
+                    except httpx.RequestError as e:
+                        # 网络连接错误，尝试重试
+                        if attempt < max_retries - 1:
+                            logger.warning(f"请求错误 (尝试 {attempt + 1}/{max_retries}): {e}，{retry_delay}秒后重试...")
+                            import asyncio
+                            await asyncio.sleep(retry_delay)
+                            retry_delay *= 2  # 指数退避
+                            continue  # 继续下一次重试
+                        else:
+                            # 达到最大重试次数，抛出异常
+                            logger.error(f"请求错误: {e}，已达到最大重试次数 {max_retries}")
+                            raise HTTPException(status_code=502, detail=f"上游服务错误: {str(e)}")
 
         # 返回流式响应
         async def claude_stream():
@@ -513,7 +546,7 @@ async def create_message(request: Request, _: bool = Depends(verify_api_key)):
 
         return StreamingResponse(
             claude_stream(),
-            media_type="text/event-stream",
+            media_type="text/event-stream; charset=utf-8",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
@@ -638,126 +671,140 @@ async def create_gemini_message(request: Request, _: bool = Depends(verify_api_k
         api_url = f"{other.get('api_endpoint', 'https://daily-cloudcode-pa.sandbox.googleapis.com')}/v1internal:streamGenerateContent?alt=sse"
 
         async def gemini_byte_stream():
+            max_retries = 3  # 最大重试次数
+            retry_delay = 1  # 重试延迟（秒）
+
             async with httpx.AsyncClient(timeout=300.0) as client:
-                try:
-                    logger.info(f"[HTTP] 开始请求 Gemini API: {api_url}")
-                    async with client.stream(
-                        "POST",
-                        api_url,
-                        json=gemini_request,
-                        headers=headers
-                    ) as response:
-                        logger.info(f"[HTTP] 收到响应: status_code={response.status_code}")
-                        logger.info(f"[HTTP] 响应头: {dict(response.headers)}")
+                for attempt in range(max_retries):
+                    try:
+                        logger.info(f"[HTTP] 开始请求 Gemini API: {api_url}")
+                        async with client.stream(
+                            "POST",
+                            api_url,
+                            json=gemini_request,
+                            headers=headers
+                        ) as response:
+                            logger.info(f"[HTTP] 收到响应: status_code={response.status_code}")
+                            logger.info(f"[HTTP] 响应头: {dict(response.headers)}")
 
-                        # 检测 Gemini API 空响应问题
-                        content_length = response.headers.get('content-length', '')
-                        if content_length == '0':
-                            logger.error("[HTTP] Gemini API 返回空响应 (content-length: 0)")
-                            # 返回标准的 Claude API SSE 流，但内容为空
-                            import json
-                            events = [
-                                'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_empty","type":"message","role":"assistant","content":[],"model":"' + claude_req.model + '","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}\n\n',
-                                'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
-                                'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
-                                'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n',
-                                'event: message_stop\ndata: {"type":"message_stop"}\n\n'
-                            ]
-                            for event in events:
-                                yield event.encode('utf-8')
-                            return
+                            # 检测 Gemini API 空响应问题
+                            content_length = response.headers.get('content-length', '')
+                            if content_length == '0':
+                                logger.error("[HTTP] Gemini API 返回空响应 (content-length: 0)")
+                                # 返回标准的 Claude API SSE 流，但内容为空
+                                import json
+                                events = [
+                                    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_empty","type":"message","role":"assistant","content":[],"model":"' + claude_req.model + '","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}\n\n',
+                                    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+                                    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+                                    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n',
+                                    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+                                ]
+                                for event in events:
+                                    yield event.encode('utf-8')
+                                return
 
-                        if response.status_code != 200:
-                            error_text = await response.aread()
-                            error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
-                            logger.error(f"Gemini API 错误: {response.status_code} {error_str}")
+                            if response.status_code != 200:
+                                error_text = await response.aread()
+                                error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
+                                logger.error(f"Gemini API 错误: {response.status_code} {error_str}")
 
-                            # 处理 429 Resource Exhausted 错误
-                            if response.status_code == 429:
-                                try:
-                                    from account_manager import mark_model_exhausted, update_account
-                                    from gemini.converter import map_claude_model_to_gemini
+                                # 处理 429 Resource Exhausted 错误
+                                if response.status_code == 429:
+                                    try:
+                                        from account_manager import mark_model_exhausted, update_account
+                                        from gemini.converter import map_claude_model_to_gemini
 
-                                    # 获取 Gemini 模型名称
-                                    gemini_model = map_claude_model_to_gemini(claude_req.model)
-                                    logger.info(f"收到 429 错误，正在调用 fetchAvailableModels 获取账号 {account['id']} 的最新配额信息...")
+                                        # 获取 Gemini 模型名称
+                                        gemini_model = map_claude_model_to_gemini(claude_req.model)
+                                        logger.info(f"收到 429 错误，正在调用 fetchAvailableModels 获取账号 {account['id']} 的最新配额信息...")
 
-                                    # 调用 fetchAvailableModels 获取最新配额信息
-                                    models_data = await token_manager.fetch_available_models(project_id)
+                                        # 调用 fetchAvailableModels 获取最新配额信息
+                                        models_data = await token_manager.fetch_available_models(project_id)
 
-                                    # 从 models_data 中提取该模型的配额信息
-                                    reset_time = None
-                                    remaining_fraction = 0
-                                    models = models_data.get("models", {})
-                                    if gemini_model in models:
-                                        quota_info = models[gemini_model].get("quotaInfo", {})
-                                        reset_time = quota_info.get("resetTime")
-                                        remaining_fraction = quota_info.get("remainingFraction", 0)
+                                        # 从 models_data 中提取该模型的配额信息
+                                        reset_time = None
+                                        remaining_fraction = 0
+                                        models = models_data.get("models", {})
+                                        if gemini_model in models:
+                                            quota_info = models[gemini_model].get("quotaInfo", {})
+                                            reset_time = quota_info.get("resetTime")
+                                            remaining_fraction = quota_info.get("remainingFraction", 0)
 
-                                    # 如果没有找到 resetTime，使用默认值（1小时后）
-                                    if not reset_time:
-                                        from datetime import datetime, timedelta, timezone
-                                        reset_time = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace('+00:00', 'Z')
-                                        logger.warning(f"未找到模型 {gemini_model} 的 resetTime，使用默认值: {reset_time}")
+                                        # 如果没有找到 resetTime，使用默认值（1小时后）
+                                        if not reset_time:
+                                            from datetime import datetime, timedelta, timezone
+                                            reset_time = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace('+00:00', 'Z')
+                                            logger.warning(f"未找到模型 {gemini_model} 的 resetTime，使用默认值: {reset_time}")
 
-                                    # 更新账号的 creditsInfo
-                                    credits_info = extract_credits_from_models_data(models_data)
-                                    other = account.get("other") or {}
-                                    if isinstance(other, str):
-                                        import json
-                                        try:
-                                            other = json.loads(other)
-                                        except json.JSONDecodeError:
-                                            other = {}
+                                        # 更新账号的 creditsInfo
+                                        credits_info = extract_credits_from_models_data(models_data)
+                                        other = account.get("other") or {}
+                                        if isinstance(other, str):
+                                            import json
+                                            try:
+                                                other = json.loads(other)
+                                            except json.JSONDecodeError:
+                                                other = {}
 
-                                    other["creditsInfo"] = credits_info
-                                    update_account(account['id'], other=other)
-                                    logger.info(f"已更新账号 {account['id']} 的配额信息")
+                                        other["creditsInfo"] = credits_info
+                                        update_account(account['id'], other=other)
+                                        logger.info(f"已更新账号 {account['id']} 的配额信息")
 
-                                    # 判断是速率限制还是配额用完
-                                    if remaining_fraction > 0.03:
-                                        # 配额充足，是速率限制（RPM/TPM）
-                                        logger.warning(f"账号 {account['id']} 触发速率限制（RPM/TPM），剩余配额: {remaining_fraction:.2%}")
-                                        raise HTTPException(
-                                            status_code=429,
-                                            detail=f"速率限制：请求过于频繁，请稍后重试（剩余配额: {remaining_fraction:.2%}）"
-                                        )
-                                    else:
-                                        # 配额不足，真的用完了
-                                        mark_model_exhausted(account['id'], gemini_model, reset_time)
-                                        logger.warning(f"账号 {account['id']} 的模型 {gemini_model} 配额已用完（剩余: {remaining_fraction:.2%}），重置时间: {reset_time}")
-                                        raise HTTPException(
-                                            status_code=429,
-                                            detail=f"配额已用完，重置时间: {reset_time}"
-                                        )
+                                        # 判断是速率限制还是配额用完
+                                        if remaining_fraction > 0.03:
+                                            # 配额充足，是速率限制（RPM/TPM）
+                                            logger.warning(f"账号 {account['id']} 触发速率限制（RPM/TPM），剩余配额: {remaining_fraction:.2%}")
+                                            raise HTTPException(
+                                                status_code=429,
+                                                detail=f"速率限制：请求过于频繁，请稍后重试（剩余配额: {remaining_fraction:.2%}）"
+                                            )
+                                        else:
+                                            # 配额不足，真的用完了
+                                            mark_model_exhausted(account['id'], gemini_model, reset_time)
+                                            logger.warning(f"账号 {account['id']} 的模型 {gemini_model} 配额已用完（剩余: {remaining_fraction:.2%}），重置时间: {reset_time}")
+                                            raise HTTPException(
+                                                status_code=429,
+                                                detail=f"配额已用完，重置时间: {reset_time}"
+                                            )
 
-                                except HTTPException:
-                                    raise
-                                except Exception as e:
-                                    logger.error(f"处理 429 错误时出错: {e}", exc_info=True)
+                                    except HTTPException:
+                                        raise
+                                    except Exception as e:
+                                        logger.error(f"处理 429 错误时出错: {e}", exc_info=True)
 
-                            raise HTTPException(
-                                status_code=response.status_code,
-                                detail=f"Gemini API 错误: {error_str}"
-                            )
+                                raise HTTPException(
+                                    status_code=response.status_code,
+                                    detail=f"Gemini API 错误: {error_str}"
+                                )
 
-                        # 返回字节流
-                        logger.info("[HTTP] 开始迭代字节流")
-                        chunk_count = 0
-                        total_bytes = 0
-                        async for chunk in response.aiter_bytes():
-                            chunk_count += 1
-                            if chunk:
-                                total_bytes += len(chunk)
-                                logger.info(f"[HTTP] Chunk {chunk_count}: {len(chunk)} 字节")
-                                yield chunk
-                            else:
-                                logger.debug(f"[HTTP] Chunk {chunk_count}: 空 chunk")
-                        logger.info(f"[HTTP] 字节流结束: 共 {chunk_count} 个 chunk, 总计 {total_bytes} 字节")
+                            # 返回字节流
+                            logger.info("[HTTP] 开始迭代字节流")
+                            chunk_count = 0
+                            total_bytes = 0
+                            async for chunk in response.aiter_bytes():
+                                chunk_count += 1
+                                if chunk:
+                                    total_bytes += len(chunk)
+                                    logger.info(f"[HTTP] Chunk {chunk_count}: {len(chunk)} 字节")
+                                    yield chunk
+                                else:
+                                    logger.debug(f"[HTTP] Chunk {chunk_count}: 空 chunk")
+                            logger.info(f"[HTTP] 字节流结束: 共 {chunk_count} 个 chunk, 总计 {total_bytes} 字节")
+                            return  # 成功完成，退出重试循环
 
-                except httpx.RequestError as e:
-                    logger.error(f"请求错误: {e}")
-                    raise HTTPException(status_code=502, detail=f"上游服务错误: {str(e)}")
+                    except httpx.RequestError as e:
+                        # 网络连接错误，尝试重试
+                        if attempt < max_retries - 1:
+                            logger.warning(f"请求错误 (尝试 {attempt + 1}/{max_retries}): {e}，{retry_delay}秒后重试...")
+                            import asyncio
+                            await asyncio.sleep(retry_delay)
+                            retry_delay *= 2  # 指数退避
+                            continue  # 继续下一次重试
+                        else:
+                            # 达到最大重试次数，抛出异常
+                            logger.error(f"请求错误: {e}，已达到最大重试次数 {max_retries}")
+                            raise HTTPException(status_code=502, detail=f"上游服务错误: {str(e)}")
 
         # 返回流式响应
         async def claude_stream():
@@ -766,7 +813,7 @@ async def create_gemini_message(request: Request, _: bool = Depends(verify_api_k
 
         return StreamingResponse(
             claude_stream(),
-            media_type="text/event-stream",
+            media_type="text/event-stream; charset=utf-8",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
@@ -810,13 +857,13 @@ async def create_antigravity_message(request: Request, _: bool = Depends(verify_
                 raise HTTPException(status_code=403, detail=f"账号已禁用: {specified_account_id}")
             if account.get('type') != 'antigravity':
                 raise HTTPException(status_code=400, detail=f"账号类型不是 Antigravity: {specified_account_id}")
-            logger.info(f"使用指定 Antigravity 账号: {account.get('label', 'N/A')} (ID: {account['id']})")
+            logger.debug(f"使用指定 Antigravity 账号: {account.get('label', 'N/A')} (ID: {account['id']})")
         else:
             # 随机选择 Antigravity 账号
             account = get_random_account(account_type="antigravity")
             if not account:
                 raise HTTPException(status_code=503, detail="没有可用的 Antigravity 账号")
-            logger.info(f"使用随机 Antigravity 账号: {account.get('label', 'N/A')} (ID: {account['id']})")
+            logger.debug(f"使用随机 Antigravity 账号: {account.get('label', 'N/A')} (ID: {account['id']})")
 
         # 解析 other 字段
         other = account.get("other") or {}
@@ -839,7 +886,7 @@ async def create_antigravity_message(request: Request, _: bool = Depends(verify_
                     refresh_token=updated_account.get("refreshToken"),
                     other=updated_account.get("other")
                 )
-                logger.info(f"Antigravity access token 已更新到数据库")
+                logger.debug(f"Antigravity access token 已更新到数据库")
                 account = updated_account
                 other = account.get("other") or {}
                 if isinstance(other, str):
@@ -868,7 +915,7 @@ async def create_antigravity_message(request: Request, _: bool = Depends(verify_
             if project_id:
                 other["project"] = project_id
                 update_account(account["id"], other=other)
-                logger.info(f"Antigravity 项目 ID 已保存: {project_id}")
+                logger.debug(f"Antigravity 项目 ID 已保存: {project_id}")
 
         if not project_id:
             project_id = ANTIGRAVITY_DEFAULT_PROJECT_ID
@@ -893,76 +940,140 @@ async def create_antigravity_message(request: Request, _: bool = Depends(verify_
         api_url = build_antigravity_request_url(api_endpoint, streaming=True)
 
         async def antigravity_byte_stream():
-            endpoints_to_try = [api_endpoint] + [e for e in ANTIGRAVITY_ENDPOINTS if e != api_endpoint]
+            max_retries = 20
+            retry_delay = 1.0  # 重试间隔（秒）
 
-            for endpoint in endpoints_to_try:
-                url = build_antigravity_request_url(endpoint, streaming=True)
+            for retry in range(max_retries):
+                endpoints_to_try = [api_endpoint] + [e for e in ANTIGRAVITY_ENDPOINTS if e != api_endpoint]
+                last_error = None
 
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    try:
-                        logger.info(f"[Antigravity HTTP] 请求: {url}")
-                        async with client.stream(
-                            "POST",
-                            url,
-                            json=antigravity_request,
-                            headers=headers
-                        ) as response:
-                            logger.info(f"[Antigravity HTTP] 响应: status_code={response.status_code}")
+                for endpoint in endpoints_to_try:
+                    url = build_antigravity_request_url(endpoint, streaming=True)
 
-                            if response.status_code >= 500:
-                                logger.warning(f"[Antigravity] 端点 {endpoint} 返回 {response.status_code}，尝试下一个")
-                                continue
+                    async with httpx.AsyncClient(timeout=300.0) as client:
+                        try:
+                            logger.debug(f"[Antigravity HTTP] 请求: {url} (重试 {retry + 1}/{max_retries})")
+                            async with client.stream(
+                                "POST",
+                                url,
+                                json=antigravity_request,
+                                headers=headers
+                            ) as response:
+                                logger.debug(f"[Antigravity HTTP] 响应: status_code={response.status_code}")
 
-                            if response.status_code != 200:
-                                error_text = await response.aread()
-                                error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
-                                logger.error(f"Antigravity API 错误: {response.status_code} {error_str}")
+                                if response.status_code >= 500:
+                                    logger.warning(f"[Antigravity] 端点 {endpoint} 返回 {response.status_code}，尝试下一个")
+                                    continue
 
                                 if response.status_code == 429:
+                                    error_text = await response.aread()
+                                    error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
+                                    logger.warning(f"[Antigravity] 429 请求过于频繁，将重试: {error_str[:100]}")
+                                    last_error = HTTPException(status_code=429, detail="请求过于频繁，请稍后重试")
+                                    break  # 跳出端点循环，进入重试
+
+                                if response.status_code == 403:
+                                    error_text = await response.aread()
+                                    error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
+                                    logger.warning(f"[Antigravity] 403 权限错误，将重试: {error_str[:100]}")
+                                    last_error = HTTPException(status_code=403, detail=f"Antigravity API 错误: {error_str}")
+                                    break  # 跳出端点循环，进入重试
+
+                                if response.status_code != 200:
+                                    error_text = await response.aread()
+                                    error_str = error_text.decode() if isinstance(error_text, bytes) else str(error_text)
+                                    logger.error(f"Antigravity API 错误: {response.status_code} {error_str}")
                                     raise HTTPException(
-                                        status_code=429,
-                                        detail="请求过于频繁，请稍后重试"
+                                        status_code=response.status_code,
+                                        detail=f"Antigravity API 错误: {error_str}"
                                     )
 
-                                raise HTTPException(
-                                    status_code=response.status_code,
-                                    detail=f"Antigravity API 错误: {error_str}"
-                                )
+                                # 返回字节流
+                                async for chunk in response.aiter_bytes():
+                                    if chunk:
+                                        yield chunk
 
-                            # 返回字节流
-                            async for chunk in response.aiter_bytes():
-                                if chunk:
-                                    yield chunk
+                                # 成功完成，记录端点
+                                if endpoint != api_endpoint:
+                                    other["api_endpoint"] = endpoint
+                                    update_account(account["id"], other=other)
+                                    logger.debug(f"[Antigravity] 切换到端点: {endpoint}")
 
-                            # 成功完成，记录端点
-                            if endpoint != api_endpoint:
-                                other["api_endpoint"] = endpoint
-                                update_account(account["id"], other=other)
-                                logger.info(f"[Antigravity] 切换到端点: {endpoint}")
+                                return
 
-                            return
+                        except httpx.ConnectError as e:
+                            logger.warning(f"[Antigravity] 端点 {endpoint} 连接失败: {e}")
+                            last_error = e
+                            continue
+                        except httpx.TimeoutException as e:
+                            logger.warning(f"[Antigravity] 端点 {endpoint} 超时: {e}")
+                            last_error = e
+                            continue
+                        except httpx.RequestError as e:
+                            logger.warning(f"[Antigravity] 端点 {endpoint} 请求错误: {e}")
+                            last_error = e
+                            continue
 
-                    except httpx.ConnectError as e:
-                        logger.warning(f"[Antigravity] 端点 {endpoint} 连接失败: {e}")
-                        continue
-                    except httpx.TimeoutException as e:
-                        logger.warning(f"[Antigravity] 端点 {endpoint} 超时: {e}")
-                        continue
+                # 如果需要重试，等待后继续
+                if retry < max_retries - 1 and last_error:
+                    logger.info(f"[Antigravity] 等待 {retry_delay} 秒后重试 ({retry + 2}/{max_retries})...")
+                    await asyncio.sleep(retry_delay)
 
+            # 所有重试都失败
+            if isinstance(last_error, HTTPException):
+                raise last_error
             raise HTTPException(status_code=502, detail="所有 Antigravity 端点都不可用")
 
-        # 返回流式响应
+        # 返回流式响应（使用锁保护，确保每个账号同时只有一个请求）
         async def claude_stream():
-            async for event in handle_antigravity_stream(
-                antigravity_byte_stream(),
-                model=claude_req.model,
-                session_id=session_id
-            ):
-                yield event
+            account_lock = await get_antigravity_account_lock(account["id"])
+            logger.debug(f"[Antigravity 限流] 账号 {account.get('label', account['id'])} 等待锁...")
+            message_started = False
+            async with account_lock:
+                logger.debug(f"[Antigravity 限流] 账号 {account.get('label', account['id'])} 获取锁，开始处理")
+                try:
+                    async for event in handle_antigravity_stream(
+                        antigravity_byte_stream(),
+                        model=claude_req.model,
+                        session_id=session_id
+                    ):
+                        # 确保 event 是字符串类型
+                        if isinstance(event, bytes):
+                            event = event.decode('utf-8')
+                        elif not isinstance(event, str):
+                            logger.warning(f"[Antigravity] 意外的事件类型: {type(event)}, 值: {event}")
+                            event = str(event)
+                        # 追踪 message_start 是否已发送
+                        if 'event: message_start' in event:
+                            message_started = True
+                        yield event
+                except Exception as e:
+                    logger.error(f"[Antigravity 流错误] {e}", exc_info=True)
+                    import json
+                    # 提取简短的错误消息
+                    error_msg = str(e)
+                    if len(error_msg) > 200:
+                        error_msg = error_msg[:200] + "..."
+
+                    # 如果 message_start 还没发送，发送完整的错误响应序列
+                    if not message_started:
+                        # 发送 message_start
+                        yield f"event: message_start\r\ndata: {json.dumps({'type': 'message_start', 'message': {'id': 'msg_error', 'type': 'message', 'role': 'assistant', 'content': [], 'model': claude_req.model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\r\n\r\n"
+                        # 发送包含错误信息的文本块
+                        yield f"event: content_block_start\r\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\r\n\r\n"
+                        yield f"event: content_block_delta\r\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': f'Error: {error_msg}'}})}\r\n\r\n"
+                        yield f"event: content_block_stop\r\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\r\n\r\n"
+                        yield f"event: message_delta\r\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'input_tokens': 0, 'output_tokens': 0}})}\r\n\r\n"
+                        yield f"event: message_stop\r\ndata: {json.dumps({'type': 'message_stop'})}\r\n\r\n"
+                    else:
+                        # message_start 已发送，只发送错误事件
+                        yield f"event: error\r\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': error_msg}})}\r\n\r\n"
+                finally:
+                    logger.debug(f"[Antigravity 限流] 账号 {account.get('label', account['id'])} 释放锁")
 
         return StreamingResponse(
             claude_stream(),
-            media_type="text/event-stream",
+            media_type="text/event-stream; charset=utf-8",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
@@ -1866,5 +1977,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         reload=False,
-        log_level="info"
+        log_level="warning",  # 减少日志输出，避免干扰 SSE 流
+        access_log=False  # 禁用 access log
     )
