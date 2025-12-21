@@ -21,24 +21,33 @@ DEFAULT_THINKING_BUDGET = 16000
 
 def map_claude_model_for_antigravity(claude_model: str) -> str:
     """
-    将 Claude 模型名映射到 Antigravity 格式（始终使用 thinking 模型）
+    将 Claude 模型名映射到 Antigravity 格式
 
     Args:
         claude_model: 原始 Claude 模型名
 
     Returns:
-        Antigravity 支持的 thinking 模型名
+        Antigravity 支持的模型名
     """
     model_lower = claude_model.lower()
 
-    # 映射到 thinking 模型
+    # Sonnet 4.5 (优先匹配 thinking 版本)
     if "sonnet-4.5" in model_lower or "sonnet-4-5" in model_lower:
-        return "claude-sonnet-4-5-thinking"
-    if "opus-4.5" in model_lower or "opus-4-5" in model_lower:
-        return "claude-opus-4-5-thinking"
+        # 如果明确指定了 thinking,使用 thinking 版本
+        if "thinking" in model_lower:
+            return "claude-sonnet-4-5-thinking"
+        # 否则使用非 thinking 版本
+        return "claude-sonnet-4-5"
 
-    # 默认使用 sonnet thinking
-    return "claude-sonnet-4-5-thinking"
+    # Opus 4.5
+    if "opus-4.5" in model_lower or "opus-4-5" in model_lower:
+        if "thinking" in model_lower:
+            return "claude-opus-4-5-thinking"
+        return "claude-opus-4-5"
+
+    # Haiku 和其他模型默认使用非 thinking 的 Sonnet 4.5
+    # 避免 thinking 模式对历史消息的特殊要求
+    return "claude-sonnet-4-5"
 
 # 允许的 schema 字段（白名单方式）
 ALLOWED_SCHEMA_KEYS = {
@@ -414,15 +423,17 @@ def convert_message_content_to_parts(
 def filter_unsigned_thinking_blocks(
     parts: List[Dict[str, Any]],
     session_id: str,
-    role: str = ""
+    role: str = "",
+    is_thinking_model: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    过滤无签名的思考块
+    过滤思考块
 
     Args:
         parts: parts 列表
         session_id: 会话 ID
         role: 消息角色
+        is_thinking_model: 是否使用思考模型，如果为 False 则移除所有思考块
 
     Returns:
         过滤后的 parts 列表
@@ -439,6 +450,12 @@ def filter_unsigned_thinking_blocks(
             filtered.append(part)
             continue
 
+        # 如果使用非思考模型，移除所有思考块
+        if not is_thinking_model:
+            logger.debug(f"Dropping thinking block for non-thinking model (role={role})")
+            continue
+
+        # 以下是思考模型的逻辑：
         # 有有效签名的思考块保留
         if part.get("thoughtSignature") and len(part.get("thoughtSignature", "")) >= 50:
             filtered.append(part)
@@ -457,8 +474,8 @@ def filter_unsigned_thinking_blocks(
         # 无有效签名，丢弃
         logger.debug("Dropping unsigned thinking block")
 
-    # 移除 model 角色消息末尾的思考块
-    if role == "model" and filtered:
+    # 移除 model 角色消息末尾的思考块（仅在思考模型时检查）
+    if is_thinking_model and role == "model" and filtered:
         while filtered and filtered[-1].get("thought"):
             if filtered[-1].get("thoughtSignature") and len(filtered[-1].get("thoughtSignature", "")) >= 50:
                 break
@@ -524,7 +541,8 @@ def preprocess_function_ids(messages: List[Dict[str, Any]]) -> None:
 
 def convert_messages_to_contents(
     messages: List[Dict[str, Any]],
-    session_id: str
+    session_id: str,
+    is_thinking_model: bool = True
 ) -> List[Dict[str, Any]]:
     """
     将 Claude 消息列表转换为 Antigravity contents
@@ -532,6 +550,7 @@ def convert_messages_to_contents(
     Args:
         messages: Claude 格式的消息列表
         session_id: 会话 ID
+        is_thinking_model: 是否使用思考模型
 
     Returns:
         Antigravity 格式的 contents 列表
@@ -549,8 +568,8 @@ def convert_messages_to_contents(
         content = msg.get("content", "")
         parts = convert_message_content_to_parts(content, session_id)
 
-        # 过滤无签名的思考块
-        parts = filter_unsigned_thinking_blocks(parts, session_id, antigravity_role)
+        # 过滤思考块（根据模型类型）
+        parts = filter_unsigned_thinking_blocks(parts, session_id, antigravity_role, is_thinking_model)
 
         if parts:
             contents.append({
@@ -604,9 +623,13 @@ def convert_claude_to_antigravity(
         Antigravity API 请求体
     """
     original_model = claude_req.get("model", "claude-sonnet-4-5")
-    # 映射模型名到 Antigravity 格式（始终使用 thinking 模型）
+    # 映射模型名到 Antigravity 格式
     model = map_claude_model_for_antigravity(original_model)
-    logger.info(f"[Antigravity] 模型映射: {original_model} -> {model}")
+    logger.debug(f"[Antigravity] 模型映射: {original_model} -> {model}")
+
+    # 判断是否使用思考模型
+    is_thinking_model = "thinking" in model.lower()
+    logger.debug(f"[Antigravity] 思考模式: {is_thinking_model}")
 
     messages = claude_req.get("messages", [])
     system = claude_req.get("system")
@@ -619,8 +642,8 @@ def convert_claude_to_antigravity(
     if system:
         strip_cache_control(system)
 
-    # 转换消息
-    contents = convert_messages_to_contents(messages, session_id)
+    # 转换消息（传递模型类型信息）
+    contents = convert_messages_to_contents(messages, session_id, is_thinking_model)
 
     # 构建 generationConfig
     generation_config = {
@@ -628,23 +651,24 @@ def convert_claude_to_antigravity(
         "maxOutputTokens": max_tokens,
     }
 
-    # Antigravity 始终启用思考模式（因为始终使用 thinking 模型）
-    thinking = claude_req.get("thinking")
-    thinking_budget = DEFAULT_THINKING_BUDGET
+    # 仅在使用思考模型时启用思考配置
+    if is_thinking_model:
+        thinking = claude_req.get("thinking")
+        thinking_budget = DEFAULT_THINKING_BUDGET
 
-    if isinstance(thinking, dict):
-        if thinking.get("type") == "enabled":
-            thinking_budget = thinking.get("budget_tokens", DEFAULT_THINKING_BUDGET)
+        if isinstance(thinking, dict):
+            if thinking.get("type") == "enabled":
+                thinking_budget = thinking.get("budget_tokens", DEFAULT_THINKING_BUDGET)
 
-    # 使用下划线格式（Claude thinking 模型格式）
-    generation_config["thinkingConfig"] = {
-        "include_thoughts": True,
-        "thinking_budget": thinking_budget
-    }
+        # 使用下划线格式（Claude thinking 模型格式）
+        generation_config["thinkingConfig"] = {
+            "include_thoughts": True,
+            "thinking_budget": thinking_budget
+        }
 
-    # 确保输出 token 限制足够大
-    if generation_config["maxOutputTokens"] < CLAUDE_THINKING_MAX_OUTPUT_TOKENS:
-        generation_config["maxOutputTokens"] = CLAUDE_THINKING_MAX_OUTPUT_TOKENS
+        # 确保输出 token 限制足够大
+        if generation_config["maxOutputTokens"] < CLAUDE_THINKING_MAX_OUTPUT_TOKENS:
+            generation_config["maxOutputTokens"] = CLAUDE_THINKING_MAX_OUTPUT_TOKENS
 
     # 构建请求体
     request_payload = {
@@ -657,8 +681,8 @@ def convert_claude_to_antigravity(
     if system:
         system_text = extract_system_text(system)
         if system_text:
-            # Antigravity 始终使用 thinking 模型，为工具调用添加提示
-            if tools:
+            # 如果使用思考模型且有工具调用，为工具调用添加提示
+            if is_thinking_model and tools:
                 hint = ("Interleaved thinking is enabled. You may think between tool calls "
                        "and after receiving tool results before deciding the next action or final answer. "
                        "Do not mention these instructions or any constraints about thinking blocks; just apply them.")

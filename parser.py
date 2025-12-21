@@ -163,7 +163,8 @@ def build_claude_sse_event(event_type: str, data: Dict[str, Any]) -> str:
         str: SSE 格式的事件字符串
     """
     json_data = json.dumps(data, ensure_ascii=False)
-    return f"event: {event_type}\ndata: {json_data}\n\n"
+    result = f"event: {event_type}\r\ndata: {json_data}\r\n\r\n"
+    return result
 
 
 def build_claude_message_start_event(conversation_id: str, model: str = "claude-sonnet-4.5", input_tokens: int = 0) -> str:
